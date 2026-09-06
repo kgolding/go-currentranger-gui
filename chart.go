@@ -22,6 +22,7 @@ var (
 	colGrid   = color.NRGBA{0x45, 0x47, 0x5a, 0xFF}
 	colTrace  = color.NRGBA{0x89, 0xdc, 0xeb, 0xFF}
 	colAvg    = color.NRGBA{0xf9, 0xe2, 0xaf, 0xFF}
+	colRoll   = color.NRGBA{0xe7, 0x4c, 0x3c, 0xFF}
 	colSel    = color.NRGBA{0x89, 0xb4, 0xfa, 0x50}
 	colFG     = color.NRGBA{0xcd, 0xd6, 0xf4, 0xFF}
 )
@@ -47,6 +48,8 @@ type ChartWidget struct {
 	plotC []float64
 	avgT  []float64 // independent time base for the smoothed average line
 	avgC  []float64
+	rollT []float64 // independent time base for the time-windowed rolling average
+	rollC []float64
 
 	xMin, xMax float64
 	yMin, yMax float64
@@ -74,14 +77,16 @@ func (c *ChartWidget) CreateRenderer() fyne.WidgetRenderer {
 	return &chartRenderer{chart: c, raster: c.raster}
 }
 
-// SetData updates the plotted series. avgT/avgC may both be nil to skip the
-// running average line. xMin/xMax/yMin/yMax define the axis ranges.
-func (c *ChartWidget) SetData(plotT, plotC, avgT, avgC []float64, xMin, xMax, yMin, yMax float64) {
+// SetData updates the plotted series. avgT/avgC and rollT/rollC may each be
+// nil to skip that line. xMin/xMax/yMin/yMax define the axis ranges.
+func (c *ChartWidget) SetData(plotT, plotC, avgT, avgC, rollT, rollC []float64, xMin, xMax, yMin, yMax float64) {
 	c.mu.Lock()
 	c.plotT = plotT
 	c.plotC = plotC
 	c.avgT = avgT
 	c.avgC = avgC
+	c.rollT = rollT
+	c.rollC = rollC
 	c.xMin, c.xMax = xMin, xMax
 	c.yMin, c.yMax = yMin, yMax
 	c.mu.Unlock()
@@ -194,6 +199,8 @@ func (c *ChartWidget) draw(w, h int) image.Image {
 	plotC := c.plotC
 	avgT := c.avgT
 	avgC := c.avgC
+	rollT := c.rollT
+	rollC := c.rollC
 	xMin, xMax := c.xMin, c.xMax
 	yMin, yMax := c.yMin, c.yMax
 	hasSel := c.hasSelection
@@ -262,6 +269,12 @@ func (c *ChartWidget) draw(w, h int) image.Image {
 	// Trace.
 	if len(plotT) > 1 {
 		drawPolyline(img, plotT, plotC, toPx, toPy, colTrace)
+	}
+
+	// Time-windowed rolling average, drawn on top so it stays readable
+	// against the noisier trace beneath it.
+	if len(rollT) == len(rollC) && len(rollT) > 1 {
+		drawPolyline(img, rollT, rollC, toPx, toPy, colRoll)
 	}
 
 	return img

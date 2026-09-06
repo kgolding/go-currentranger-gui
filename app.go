@@ -9,6 +9,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 )
@@ -18,8 +19,10 @@ const (
 	maxDisplayPoints  = 4000
 )
 
-var windowOptions = []string{"5s", "10s", "30s", "60s", "5m", "All"}
-var windowSeconds = map[string]float64{"5s": 5, "10s": 10, "30s": 30, "60s": 60, "5m": 300, "All": 0}
+var windowOptions = []string{"1s", "2s", "3s", "4s", "5s", "10s", "30s", "60s", "5m", "All"}
+var windowSeconds = map[string]float64{
+	"1s": 1, "2s": 2, "3s": 3, "4s": 4, "5s": 5, "10s": 10, "30s": 30, "60s": 60, "5m": 300, "All": 0,
+}
 
 var scaleOptions = []string{"Auto", "100 µA", "1 mA", "10 mA", "100 mA", "500 mA", "1 A"}
 var scaleAmps = map[string]float64{
@@ -32,6 +35,16 @@ var scaleAmps = map[string]float64{
 	"1 A":    1,
 }
 
+var rollAvgOptions = []string{
+	"5ms", "10ms", "50ms", "100ms", "250ms", "500ms", "750ms",
+	"1s", "2s", "3s", "4s", "5s", "10s", "20s", "30s",
+}
+var rollAvgMillis = map[string]float64{
+	"5ms": 5, "10ms": 10, "50ms": 50, "100ms": 100, "250ms": 250, "500ms": 500, "750ms": 750,
+	"1s": 1000, "2s": 2000, "3s": 3000, "4s": 4000, "5s": 5000,
+	"10s": 10000, "20s": 20000, "30s": 30000,
+}
+
 // App owns all UI state and the live-update loop. It mirrors
 // CurrentRangerApp from the Python version.
 type App struct {
@@ -39,9 +52,10 @@ type App struct {
 	reader *SerialReader
 	chart  *ChartWidget
 
-	timeWindow float64
-	yScale     float64 // 0 = auto-range; otherwise a fixed full-scale amps value
-	paused     bool
+	timeWindow   float64
+	yScale       float64 // 0 = auto-range; otherwise a fixed full-scale amps value
+	rollingAvgMs float64 // rolling-average window, in milliseconds
+	paused       bool
 	pausedTs   []float64
 	pausedCur  []float64
 	plotT0     float64 // absolute timestamp of current window's left edge
@@ -52,27 +66,29 @@ type App struct {
 	// Toolbar widgets.
 	portSelect   *widget.Select
 	connectBtn   *widget.Button
-	windowSelect *widget.Select
-	scaleSelect  *widget.Select
+	windowSelect  *widget.Select
+	scaleSelect   *widget.Select
+	rollAvgSelect *widget.Select
 	pauseBtn     *widget.Button
 
 	// Stat labels.
 	statCurrent, statAvg, statPeak, statMin, statSamples, statRate *widget.Label
 	selAvg, selPeak, selMin, selSamples, selDuration               *widget.Label
-	statusLabel                                                    *widget.Label
 
 	stopUpdate chan struct{}
 
 	initialPort      string
 	toolbarContainer *fyne.Container
+	portBox          *fyne.Container // fixed-width wrapper around portSelect
 }
 
 func NewCurrentRangerApp(win fyne.Window, initialPort string) *App {
 	a := &App{
-		win:        win,
-		chart:      NewChartWidget(),
-		timeWindow: 30,
-		stopUpdate: make(chan struct{}),
+		win:          win,
+		chart:        NewChartWidget(),
+		timeWindow:   30,
+		rollingAvgMs: 1000,
+		stopUpdate:   make(chan struct{}),
 	}
 	a.chart.OnSelectionChanged = a.onSelectionChanged
 	a.chart.OnScrollZoom = a.onScrollZoom
@@ -85,11 +101,8 @@ func (a *App) Build() fyne.CanvasObject {
 	a.buildToolbar()
 	statsPanel := a.buildStatsPanel()
 
-	a.statusLabel = widget.NewLabel("Disconnected")
-
-	content := container.NewBorder(
-		a.toolbarContainer, a.statusLabel, nil, statsPanel,
-		a.chart,
+	content := container.New(&mainLayout{},
+		a.toolbarContainer, statsPanel, a.chart,
 	)
 
 	a.refreshPorts(a.initialPort)
@@ -109,71 +122,91 @@ func (a *App) Build() fyne.CanvasObject {
 
 func (a *App) buildToolbar() {
 	a.portSelect = widget.NewSelect(nil, func(string) {})
+	// Wrapped in a fixed-size box so the 50%-wider target sticks — inside
+	// a plain HBox, the container would just re-shrink it to MinSize on
+	// every layout pass. refreshPorts() re-sizes this box once real port
+	// names are loaded, since MinSize() is near-empty before that.
+	portMin := a.portSelect.MinSize()
+	a.portBox = container.New(
+		layout.NewGridWrapLayout(fyne.NewSize(portMin.Width*1.5, portMin.Height)),
+		a.portSelect,
+	)
 
 	refreshBtn := widget.NewButton("Refresh", func() { a.refreshPorts("") })
-
 	a.connectBtn = widget.NewButton("Connect", a.toggleConnect)
+	a.pauseBtn = widget.NewButton("Pause", a.togglePause)
+	exportBtn := widget.NewButton("Export CSV", a.exportCSV)
+	clearBtn := widget.NewButton("Clear", a.clearData)
 
+	a.toolbarContainer = container.NewHBox(
+		widget.NewLabel("Port:"), a.portBox, refreshBtn, a.connectBtn,
+		layout.NewSpacer(),
+		exportBtn, clearBtn, a.pauseBtn,
+	)
+}
+
+// buildStatsPanel lays out the sidebar as three always-horizontal
+// (label-beside-value) form groups: SETTINGS (moved here from the
+// toolbar), LIVE STATS, and SELECTION.
+func (a *App) buildStatsPanel() fyne.CanvasObject {
 	a.windowSelect = widget.NewSelect(windowOptions, a.onWindowChange)
 	a.windowSelect.Selected = "30s"
 
 	a.scaleSelect = widget.NewSelect(scaleOptions, a.onScaleChange)
 	a.scaleSelect.Selected = "Auto"
 
-	a.pauseBtn = widget.NewButton("Pause", a.togglePause)
+	a.rollAvgSelect = widget.NewSelect(rollAvgOptions, a.onRollAvgChange)
+	a.rollAvgSelect.Selected = "1s"
 
-	exportBtn := widget.NewButton("Export CSV", a.exportCSV)
-	clearBtn := widget.NewButton("Clear", a.clearData)
-
-	a.toolbarContainer = container.NewHBox(
-		widget.NewLabel("Port:"), a.portSelect, refreshBtn, a.connectBtn,
-		widget.NewSeparator(),
-		widget.NewLabel("Window:"), a.windowSelect, a.pauseBtn,
-		widget.NewSeparator(),
-		widget.NewLabel("Scale:"), a.scaleSelect,
-		exportBtn, clearBtn,
+	settings := container.New(layout.NewFormLayout(),
+		widget.NewLabel("Window"), a.windowSelect,
+		widget.NewLabel("Scale"), a.scaleSelect,
+		widget.NewLabel("Roll Avg"), a.rollAvgSelect,
 	)
-}
 
-func (a *App) buildStatsPanel() fyne.CanvasObject {
-	mk := func(label string) *widget.Label {
-		l := widget.NewLabel("---")
-		return l
-	}
-	a.statCurrent = mk("Current")
-	a.statAvg = mk("Average")
-	a.statPeak = mk("Peak")
-	a.statMin = mk("Minimum")
+	mk := func() *widget.Label { return widget.NewLabel("---") }
+	a.statCurrent = mk()
+	a.statAvg = mk()
+	a.statPeak = mk()
+	a.statMin = mk()
 	a.statSamples = widget.NewLabel("0")
-	a.statRate = mk("Rate")
+	a.statRate = mk()
 
-	a.selAvg = mk("Avg")
-	a.selPeak = mk("Peak")
-	a.selMin = mk("Min")
-	a.selSamples = mk("Samples")
-	a.selDuration = mk("Duration")
+	live := container.New(layout.NewFormLayout(),
+		widget.NewLabel("Current"), a.statCurrent,
+		widget.NewLabel("Average"), a.statAvg,
+		widget.NewLabel("Peak"), a.statPeak,
+		widget.NewLabel("Minimum"), a.statMin,
+		widget.NewLabel("Samples"), a.statSamples,
+		widget.NewLabel("Rate"), a.statRate,
+	)
 
-	row := func(name string, val *widget.Label) fyne.CanvasObject {
-		return container.NewVBox(widget.NewLabel(name), val)
+	a.selAvg = mk()
+	a.selPeak = mk()
+	a.selMin = mk()
+	a.selSamples = mk()
+	a.selDuration = mk()
+
+	sel := container.New(layout.NewFormLayout(),
+		widget.NewLabel("Avg"), a.selAvg,
+		widget.NewLabel("Peak"), a.selPeak,
+		widget.NewLabel("Min"), a.selMin,
+		widget.NewLabel("Samples"), a.selSamples,
+		widget.NewLabel("Duration"), a.selDuration,
+	)
+
+	header := func(title string) fyne.CanvasObject {
+		return widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	}
 
-	live := container.NewVBox(
-		widget.NewLabelWithStyle("LIVE STATS", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		row("Current", a.statCurrent),
-		row("Average", a.statAvg),
-		row("Peak", a.statPeak),
-		row("Minimum", a.statMin),
-		row("Samples", a.statSamples),
-		row("Rate", a.statRate),
+	content := container.NewVBox(
+		header("SETTINGS"), settings,
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("SELECTION", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		row("Avg", a.selAvg),
-		row("Peak", a.selPeak),
-		row("Min", a.selMin),
-		row("Samples", a.selSamples),
-		row("Duration", a.selDuration),
+		header("LIVE STATS"), live,
+		widget.NewSeparator(),
+		header("SELECTION"), sel,
 	)
-	return container.NewVScroll(live)
+	return container.NewVScroll(content)
 }
 
 func (a *App) refreshPorts(preferred string) {
@@ -201,6 +234,13 @@ func (a *App) refreshPorts(preferred string) {
 	}
 	a.portSelect.SetSelected(chosen)
 	a.portSelect.Refresh()
+
+	// Options weren't loaded yet when portBox was first sized in
+	// buildToolbar, so MinSize() was near-empty; re-derive the 50%-wider
+	// target now that real port names (e.g. "/dev/ttyACM0") are in.
+	portMin := a.portSelect.MinSize()
+	a.portBox.Layout = layout.NewGridWrapLayout(fyne.NewSize(portMin.Width*1.5, portMin.Height))
+	a.portBox.Refresh()
 }
 
 // --- connection ---------------------------------------------------------
@@ -235,12 +275,10 @@ func (a *App) checkConnection() {
 		dialog.ShowError(err, a.win)
 		a.reader.Stop()
 		a.reader = nil
-		a.statusLabel.SetText("Connection failed")
 		return
 	}
 	if a.reader.IsRunning() {
 		a.connectBtn.SetText("Disconnect")
-		a.statusLabel.SetText(fmt.Sprintf("Connected to %s", a.reader.Port()))
 	}
 }
 
@@ -250,7 +288,6 @@ func (a *App) disconnect() {
 		a.reader = nil
 	}
 	a.connectBtn.SetText("Connect")
-	a.statusLabel.SetText("Disconnected")
 }
 
 // --- controls -------------------------------------------------------------
@@ -265,6 +302,11 @@ func (a *App) onWindowChange(val string) {
 
 func (a *App) onScaleChange(val string) {
 	a.yScale = scaleAmps[val]
+	a.tick()
+}
+
+func (a *App) onRollAvgChange(val string) {
+	a.rollingAvgMs = rollAvgMillis[val]
 	a.tick()
 }
 
@@ -317,7 +359,7 @@ func (a *App) exportCSV() {
 			dialog.ShowError(werr, a.win)
 			return
 		}
-		a.statusLabel.SetText(fmt.Sprintf("Exported %d samples to %s", n, path))
+		dialog.ShowInformation("Export", fmt.Sprintf("Exported %d samples to %s", n, path), a.win)
 	}, a.win)
 	saveDialog.SetFileName(fmt.Sprintf("current_log_%s.csv", time.Now().Format("20060102_150405")))
 	saveDialog.SetLocation(defaultExportLocation())
@@ -398,7 +440,7 @@ func (a *App) tick() {
 	// keeps returning the last samples collected before the failure.
 	if !a.reader.IsRunning() {
 		if err := a.reader.Error(); err != nil {
-			a.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+			dialog.ShowError(err, a.win)
 		}
 		a.disconnect()
 		return
@@ -440,9 +482,10 @@ func (a *App) tick() {
 
 	traceT, traceC := downsample(relT, visCur, maxDisplayPoints)
 	avgT, avgC := runningAverage(relT, visCur, maxDisplayPoints)
+	rollT, rollC := timeRollingAverage(relT, visCur, a.rollingAvgMs/1000, maxDisplayPoints)
 
 	yLo, yHi := a.yAxisRange(minVal, peakVal)
-	a.chart.SetData(traceT, traceC, avgT, avgC, relT[0], relT[len(relT)-1], yLo, yHi)
+	a.chart.SetData(traceT, traceC, avgT, avgC, rollT, rollC, relT[0], relT[len(relT)-1], yLo, yHi)
 
 	if a.hasSelection {
 		a.chart.SetSelection(a.selAbsT0-t0, a.selAbsT1-t0, true)
@@ -457,10 +500,11 @@ func (a *App) renderPaused() {
 	relT := relativeTimes(a.pausedTs, a.plotT0)
 	traceT, traceC := downsample(relT, a.pausedCur, maxDisplayPoints)
 	avgT, avgC := runningAverage(relT, a.pausedCur, maxDisplayPoints)
+	rollT, rollC := timeRollingAverage(relT, a.pausedCur, a.rollingAvgMs/1000, maxDisplayPoints)
 
 	_, peakVal, minVal := stats(a.pausedCur)
 	yLo, yHi := a.yAxisRange(minVal, peakVal)
-	a.chart.SetData(traceT, traceC, avgT, avgC, relT[0], relT[len(relT)-1], yLo, yHi)
+	a.chart.SetData(traceT, traceC, avgT, avgC, rollT, rollC, relT[0], relT[len(relT)-1], yLo, yHi)
 
 	if a.hasSelection {
 		a.computeSelectionStats(a.pausedTs, a.pausedCur)
@@ -495,8 +539,6 @@ func (a *App) computeSelectionStats(ts, cur []float64) {
 		duration = selT[len(selT)-1] - selT[0]
 	}
 	a.selDuration.SetText(fmt.Sprintf("%.3f s", duration))
-	a.statusLabel.SetText(fmt.Sprintf("Selection: %s avg over %.3fs (%d samples)",
-		formatCurrent(avg), duration, len(selC)))
 }
 
 func (a *App) OnClose() {
@@ -634,6 +676,41 @@ func runningAverage(t, c []float64, maxPoints int) ([]float64, []float64) {
 		stride = 1
 	}
 	var outT, outC []float64
+	for i := 0; i < n; i += stride {
+		outT = append(outT, t[i])
+		outC = append(outC, avg[i])
+	}
+	return outT, outC
+}
+
+// timeRollingAverage computes a trailing moving average over a real-time
+// window (windowSec), unlike runningAverage's sample-count window — the
+// averaging window stays a fixed duration (e.g. ~1s of wall-clock data)
+// regardless of the current sample rate. t must be sorted ascending.
+func timeRollingAverage(t, c []float64, windowSec float64, maxPoints int) (outT, outC []float64) {
+	n := len(c)
+	if n == 0 || windowSec <= 0 {
+		return nil, nil
+	}
+	avg := make([]float64, n)
+	sum := 0.0
+	start := 0
+	for i := 0; i < n; i++ {
+		sum += c[i]
+		for t[i]-t[start] > windowSec {
+			sum -= c[start]
+			start++
+		}
+		avg[i] = sum / float64(i-start+1)
+	}
+
+	if n <= maxPoints {
+		return t, avg
+	}
+	stride := n / maxPoints
+	if stride < 1 {
+		stride = 1
+	}
 	for i := 0; i < n; i += stride {
 		outT = append(outT, t[i])
 		outC = append(outC, avg[i])
