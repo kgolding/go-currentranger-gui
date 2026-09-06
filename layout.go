@@ -4,7 +4,7 @@ import "fyne.io/fyne/v2"
 
 // sidebarWidth is the stats sidebar's fixed width — wide enough for its
 // label/value pairs to sit side by side rather than stacked.
-const sidebarWidth float32 = 260
+const sidebarWidth float32 = 330
 
 // mainLayout arranges the toolbar (top), stats sidebar (right, fixed
 // width) and chart (center) — like container.NewBorder, but pins the

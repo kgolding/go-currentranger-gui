@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"math"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,8 +17,8 @@ import (
 )
 
 const (
-	updateInterval    = 50 * time.Millisecond
-	maxDisplayPoints  = 4000
+	updateInterval   = 50 * time.Millisecond
+	maxDisplayPoints = 4000
 )
 
 var windowOptions = []string{"1s", "2s", "3s", "4s", "5s", "10s", "30s", "60s", "5m", "All"}
@@ -24,12 +26,15 @@ var windowSeconds = map[string]float64{
 	"1s": 1, "2s": 2, "3s": 3, "4s": 4, "5s": 5, "10s": 10, "30s": 30, "60s": 60, "5m": 300, "All": 0,
 }
 
-var scaleOptions = []string{"Auto", "100 µA", "1 mA", "10 mA", "100 mA", "500 mA", "1 A"}
+var scaleOptions = []string{"Auto", "100 µA", "500 µA", "1 mA", "5 mA", "10 mA", "50 mA", "100 mA", "500 mA", "1 A"}
 var scaleAmps = map[string]float64{
 	"Auto":   0,
 	"100 µA": 100e-6,
+	"500 µA": 500e-6,
 	"1 mA":   1e-3,
+	"5 mA":   5e-3,
 	"10 mA":  10e-3,
+	"50 mA":  50e-3,
 	"100 mA": 100e-3,
 	"500 mA": 500e-3,
 	"1 A":    1,
@@ -45,6 +50,13 @@ var rollAvgMillis = map[string]float64{
 	"10s": 10000, "20s": 20000, "30s": 30000,
 }
 
+// smoothOptions/smoothWindows: a light noise filter distinct from Roll
+// Avg's overlay line — this averages over the trailing N *raw* readings
+// and replaces the plotted/stat values themselves, rather than adding
+// another line.
+var smoothOptions = []string{"Off", "3", "5", "10", "20", "50", "100"}
+var smoothWindows = map[string]int{"Off": 1, "3": 3, "5": 5, "10": 10, "20": 20, "50": 50, "100": 100}
+
 // App owns all UI state and the live-update loop. It mirrors
 // CurrentRangerApp from the Python version.
 type App struct {
@@ -55,25 +67,36 @@ type App struct {
 	timeWindow   float64
 	yScale       float64 // 0 = auto-range; otherwise a fixed full-scale amps value
 	rollingAvgMs float64 // rolling-average window, in milliseconds
-	paused       bool
-	pausedTs   []float64
-	pausedCur  []float64
-	plotT0     float64 // absolute timestamp of current window's left edge
+	smoothWindow int     // trailing-average noise filter, in raw samples (1 = off)
+	voltage      float64 // nominal DUT voltage, in volts; 0 = not set (power display disabled)
+
+	// Auto-scale Y range, recomputed at most once a second (see
+	// liveYAxisRange) so the axis doesn't visibly jump around every tick.
+	autoYLo, autoYHi float64
+	lastAutoScale    time.Time
+
+	paused    bool
+	pausedTs  []float64
+	pausedCur []float64
+	plotT0    float64 // absolute timestamp of current window's left edge
 
 	hasSelection       bool
 	selAbsT0, selAbsT1 float64
 
 	// Toolbar widgets.
-	portSelect   *widget.Select
-	connectBtn   *widget.Button
+	portSelect    *widget.Select
+	connectBtn    *widget.Button
 	windowSelect  *widget.Select
 	scaleSelect   *widget.Select
 	rollAvgSelect *widget.Select
-	pauseBtn     *widget.Button
+	smoothSelect  *widget.Select
+	pauseBtn      *widget.Button
 
 	// Stat labels.
 	statCurrent, statAvg, statPeak, statMin, statSamples, statRate *widget.Label
 	selAvg, selPeak, selMin, selSamples, selDuration               *widget.Label
+	pwrCurrent, pwrAvg, pwrPeak, pwrMin                            *widget.Label
+	selPwrAvg, selPwrPeak, selPwrMin                               *widget.Label
 
 	stopUpdate chan struct{}
 
@@ -88,6 +111,7 @@ func NewCurrentRangerApp(win fyne.Window, initialPort string) *App {
 		chart:        NewChartWidget(),
 		timeWindow:   10,
 		rollingAvgMs: 1000,
+		smoothWindow: 50,
 		stopUpdate:   make(chan struct{}),
 	}
 	a.chart.OnSelectionChanged = a.onSelectionChanged
@@ -158,10 +182,47 @@ func (a *App) buildStatsPanel() fyne.CanvasObject {
 	a.rollAvgSelect = widget.NewSelect(rollAvgOptions, a.onRollAvgChange)
 	a.rollAvgSelect.Selected = "1s"
 
+	a.smoothSelect = widget.NewSelect(smoothOptions, a.onSmoothChange)
+	a.smoothSelect.Selected = "50"
+
+	voltageEntry := widget.NewEntry()
+	voltageEntry.Validator = func(s string) error {
+		if s == "" {
+			return nil // not set yet - neutral, not an error
+		}
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("must be a positive number")
+		}
+		return nil
+	}
+	// Otherwise the invalid indicator is suppressed while the field has
+	// focus (Fyne holds off to avoid flashing red mid-edit).
+	voltageEntry.AlwaysShowValidationError = true
+	voltageEntry.OnChanged = func(s string) {
+		// Strip anything but digits and a single '.' as it's typed, so the
+		// field only ever holds a plausible decimal number — SetText
+		// re-fires OnChanged with the cleaned string, which then falls
+		// through to the parse below.
+		clean := sanitizeDecimalInput(s)
+		if clean != s {
+			voltageEntry.SetText(clean)
+			return
+		}
+		if s == "" {
+			a.voltage = 0 // cleared -> power display disabled, not an error
+		} else if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
+			a.voltage = v
+		}
+		fyne.Do(a.tick)
+	}
+
 	settings := container.New(layout.NewFormLayout(),
 		widget.NewLabel("Window"), a.windowSelect,
 		widget.NewLabel("Scale"), a.scaleSelect,
 		widget.NewLabel("Roll Avg"), a.rollAvgSelect,
+		widget.NewLabel("Smoothing"), a.smoothSelect,
+		widget.NewLabel("Voltage (V)"), voltageEntry,
 	)
 
 	mk := func() *widget.Label { return widget.NewLabel("---") }
@@ -171,14 +232,21 @@ func (a *App) buildStatsPanel() fyne.CanvasObject {
 	a.statMin = mk()
 	a.statSamples = widget.NewLabel("0")
 	a.statRate = mk()
+	a.pwrCurrent = mk()
+	a.pwrAvg = mk()
+	a.pwrPeak = mk()
+	a.pwrMin = mk()
 
-	live := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Current"), a.statCurrent,
-		widget.NewLabel("Average"), a.statAvg,
-		widget.NewLabel("Peak"), a.statPeak,
-		widget.NewLabel("Minimum"), a.statMin,
-		widget.NewLabel("Samples"), a.statSamples,
-		widget.NewLabel("Rate"), a.statRate,
+	// Three columns — label, current-based value, power value — rather
+	// than a separate POWER section; Samples/Rate have no power
+	// equivalent, so their third cell is just left blank.
+	live := container.New(layout.NewGridLayoutWithColumns(3),
+		widget.NewLabel("Current"), a.statCurrent, a.pwrCurrent,
+		widget.NewLabel("Average"), a.statAvg, a.pwrAvg,
+		widget.NewLabel("Peak"), a.statPeak, a.pwrPeak,
+		widget.NewLabel("Minimum"), a.statMin, a.pwrMin,
+		widget.NewLabel("Samples"), a.statSamples, widget.NewLabel(""),
+		widget.NewLabel("Rate"), a.statRate, widget.NewLabel(""),
 	)
 
 	a.selAvg = mk()
@@ -186,17 +254,39 @@ func (a *App) buildStatsPanel() fyne.CanvasObject {
 	a.selMin = mk()
 	a.selSamples = mk()
 	a.selDuration = mk()
+	a.selPwrAvg = mk()
+	a.selPwrPeak = mk()
+	a.selPwrMin = mk()
 
-	sel := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Avg"), a.selAvg,
-		widget.NewLabel("Peak"), a.selPeak,
-		widget.NewLabel("Min"), a.selMin,
-		widget.NewLabel("Samples"), a.selSamples,
-		widget.NewLabel("Duration"), a.selDuration,
+	// Same label/current/power three-column layout as LIVE STATS; Samples
+	// and Duration have no power equivalent, so their third cell is blank.
+	sel := container.New(layout.NewGridLayoutWithColumns(3),
+		widget.NewLabel("Avg"), a.selAvg, a.selPwrAvg,
+		widget.NewLabel("Peak"), a.selPeak, a.selPwrPeak,
+		widget.NewLabel("Min"), a.selMin, a.selPwrMin,
+		widget.NewLabel("Samples"), a.selSamples, widget.NewLabel(""),
+		widget.NewLabel("Duration"), a.selDuration, widget.NewLabel(""),
 	)
 
 	header := func(title string) fyne.CanvasObject {
 		return widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	}
+
+	repoURL, _ := url.Parse("https://github.com/kgolding/go-currentranger-gui")
+	attribution := widget.NewHyperlinkWithStyle(
+		"github.com/kgolding/go-currentranger-gui", repoURL,
+		fyne.TextAlignCenter, fyne.TextStyle{Italic: true},
+	)
+	attribution.Wrapping = fyne.TextWrapWord
+	// The default tap handler just fire-and-forgets an `xdg-open` (or
+	// platform equivalent) and never learns whether it actually opened a
+	// browser — on a system with no working URL handler that's a tap that
+	// visibly does nothing. Copying the link and confirming it guarantees
+	// the click always has some visible effect either way.
+	attribution.OnTapped = func() {
+		_ = fyne.CurrentApp().OpenURL(repoURL)
+		a.win.Clipboard().SetContent(repoURL.String())
+		dialog.ShowInformation("Repository", "Link copied to clipboard:\n"+repoURL.String(), a.win)
 	}
 
 	content := container.NewVBox(
@@ -205,6 +295,8 @@ func (a *App) buildStatsPanel() fyne.CanvasObject {
 		header("LIVE STATS"), live,
 		widget.NewSeparator(),
 		header("SELECTION"), sel,
+		widget.NewSeparator(),
+		attribution,
 	)
 	return container.NewVScroll(content)
 }
@@ -310,6 +402,11 @@ func (a *App) onRollAvgChange(val string) {
 	fyne.Do(a.tick)
 }
 
+func (a *App) onSmoothChange(val string) {
+	a.smoothWindow = smoothWindows[val]
+	fyne.Do(a.tick)
+}
+
 func (a *App) togglePause() {
 	a.paused = !a.paused
 	if a.paused {
@@ -335,6 +432,10 @@ func (a *App) clearData() {
 	a.statPeak.SetText("---")
 	a.statMin.SetText("---")
 	a.statSamples.SetText("0")
+	a.pwrCurrent.SetText("---")
+	a.pwrAvg.SetText("---")
+	a.pwrPeak.SetText("---")
+	a.pwrMin.SetText("---")
 }
 
 func (a *App) exportCSV() {
@@ -354,7 +455,7 @@ func (a *App) exportCSV() {
 		}
 		defer uc.Close()
 		path := uc.URI().Path()
-		n, werr := exportCSV(path, ts, cur, a.hasSelection, a.selAbsT0, a.selAbsT1)
+		n, werr := exportCSV(path, ts, cur, a.hasSelection, a.selAbsT0, a.selAbsT1, a.voltage)
 		if werr != nil {
 			dialog.ShowError(werr, a.win)
 			return
@@ -411,6 +512,9 @@ func (a *App) clearSelectionStats() {
 	a.selMin.SetText("---")
 	a.selSamples.SetText("---")
 	a.selDuration.SetText("---")
+	a.selPwrAvg.SetText("---")
+	a.selPwrPeak.SetText("---")
+	a.selPwrMin.SetText("---")
 	a.chart.SetSelection(0, 0, false)
 }
 
@@ -459,6 +563,9 @@ func (a *App) tick() {
 	if len(visCur) == 0 {
 		return
 	}
+	if a.smoothWindow > 1 {
+		visCur = trailingAverage(visCur, a.smoothWindow)
+	}
 
 	nowVal := visCur[len(visCur)-1]
 	avgVal, peakVal, minVal := stats(visCur)
@@ -468,6 +575,7 @@ func (a *App) tick() {
 	a.statPeak.SetText(formatCurrent(peakVal))
 	a.statMin.SetText(formatCurrent(minVal))
 	a.statSamples.SetText(fmt.Sprintf("%d", len(ts)))
+	a.updatePowerStats(nowVal, avgVal, peakVal, minVal)
 
 	if len(visTs) > 1 {
 		dt := visTs[len(visTs)-1] - visTs[0]
@@ -484,7 +592,7 @@ func (a *App) tick() {
 	avgT, avgC := runningAverage(relT, visCur, maxDisplayPoints)
 	rollT, rollC := timeRollingAverage(relT, visCur, a.rollingAvgMs/1000, maxDisplayPoints)
 
-	yLo, yHi := a.yAxisRange(minVal, peakVal)
+	yLo, yHi := a.liveYAxisRange(minVal, peakVal)
 	a.chart.SetData(traceT, traceC, avgT, avgC, rollT, rollC, relT[0], relT[len(relT)-1], yLo, yHi)
 
 	if a.hasSelection {
@@ -497,17 +605,22 @@ func (a *App) renderPaused() {
 	if len(a.pausedTs) == 0 {
 		return
 	}
-	relT := relativeTimes(a.pausedTs, a.plotT0)
-	traceT, traceC := downsample(relT, a.pausedCur, maxDisplayPoints)
-	avgT, avgC := runningAverage(relT, a.pausedCur, maxDisplayPoints)
-	rollT, rollC := timeRollingAverage(relT, a.pausedCur, a.rollingAvgMs/1000, maxDisplayPoints)
+	cur := a.pausedCur
+	if a.smoothWindow > 1 {
+		cur = trailingAverage(cur, a.smoothWindow)
+	}
 
-	_, peakVal, minVal := stats(a.pausedCur)
+	relT := relativeTimes(a.pausedTs, a.plotT0)
+	traceT, traceC := downsample(relT, cur, maxDisplayPoints)
+	avgT, avgC := runningAverage(relT, cur, maxDisplayPoints)
+	rollT, rollC := timeRollingAverage(relT, cur, a.rollingAvgMs/1000, maxDisplayPoints)
+
+	_, peakVal, minVal := stats(cur)
 	yLo, yHi := a.yAxisRange(minVal, peakVal)
 	a.chart.SetData(traceT, traceC, avgT, avgC, rollT, rollC, relT[0], relT[len(relT)-1], yLo, yHi)
 
 	if a.hasSelection {
-		a.computeSelectionStats(a.pausedTs, a.pausedCur)
+		a.computeSelectionStats(a.pausedTs, cur)
 	}
 }
 
@@ -527,6 +640,9 @@ func (a *App) computeSelectionStats(ts, cur []float64) {
 		a.selMin.SetText("---")
 		a.selSamples.SetText("---")
 		a.selDuration.SetText("---")
+		a.selPwrAvg.SetText("---")
+		a.selPwrPeak.SetText("---")
+		a.selPwrMin.SetText("---")
 		return
 	}
 	avg, peak, min := stats(selC)
@@ -539,6 +655,16 @@ func (a *App) computeSelectionStats(ts, cur []float64) {
 		duration = selT[len(selT)-1] - selT[0]
 	}
 	a.selDuration.SetText(fmt.Sprintf("%.3f s", duration))
+
+	if a.voltage > 0 {
+		a.selPwrAvg.SetText(formatPower(avg * a.voltage))
+		a.selPwrPeak.SetText(formatPower(peak * a.voltage))
+		a.selPwrMin.SetText(formatPower(min * a.voltage))
+	} else {
+		a.selPwrAvg.SetText("---")
+		a.selPwrPeak.SetText("---")
+		a.selPwrMin.SetText("---")
+	}
 }
 
 func (a *App) OnClose() {
@@ -547,6 +673,24 @@ func (a *App) OnClose() {
 }
 
 // --- numeric helpers --------------------------------------------------
+
+// sanitizeDecimalInput strips everything but digits and at most one '.'
+// from s, used to keep a numeric entry field from ever holding anything
+// but a plausible (possibly partial) decimal number as the user types.
+func sanitizeDecimalInput(s string) string {
+	var b strings.Builder
+	seenDot := false
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.' && !seenDot:
+			seenDot = true
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
 
 // yAxisRange picks the chart's Y bounds: auto-fit to the visible data with
 // a 5% margin, or a fixed -yScale..+yScale range when the user has pinned a
@@ -563,6 +707,44 @@ func (a *App) yAxisRange(minVal, peakVal float64) (lo, hi float64) {
 		margin = math.Abs(peakVal)*0.1 + 1e-9
 	}
 	return minVal - margin, peakVal + margin
+}
+
+// autoScaleInterval caps how often Auto mode's axis bounds are recomputed.
+// Recalculating on every 50ms tick made the axis visibly jump around as
+// peak/min drifted tick to tick; holding it steady for a beat reads as a
+// much calmer chart without hiding real, sustained range changes.
+const autoScaleInterval = 3 * time.Second
+
+// liveYAxisRange wraps yAxisRange for the live (non-paused) render path,
+// throttling Auto-mode recomputation to autoScaleInterval. A pinned scale
+// is already stable frame-to-frame, so it passes straight through.
+func (a *App) liveYAxisRange(minVal, peakVal float64) (lo, hi float64) {
+	if a.yScale > 0 {
+		return a.yAxisRange(minVal, peakVal)
+	}
+	if now := time.Now(); now.Sub(a.lastAutoScale) >= autoScaleInterval || a.autoYHi <= a.autoYLo {
+		a.autoYLo, a.autoYHi = a.yAxisRange(minVal, peakVal)
+		a.lastAutoScale = now
+	}
+	return a.autoYLo, a.autoYHi
+}
+
+// updatePowerStats fills the POWER group from the same now/avg/peak/min
+// values tick() already computed in amps, multiplying by the nominal DUT
+// voltage. With no voltage set, it shows "---" like every other stat label
+// does before it has data.
+func (a *App) updatePowerStats(now, avg, peak, min float64) {
+	if a.voltage <= 0 {
+		a.pwrCurrent.SetText("---")
+		a.pwrAvg.SetText("---")
+		a.pwrPeak.SetText("---")
+		a.pwrMin.SetText("---")
+		return
+	}
+	a.pwrCurrent.SetText(formatPower(now * a.voltage))
+	a.pwrAvg.SetText(formatPower(avg * a.voltage))
+	a.pwrPeak.SetText(formatPower(peak * a.voltage))
+	a.pwrMin.SetText(formatPower(min * a.voltage))
 }
 
 func stats(c []float64) (avg, peak, min float64) {
@@ -716,6 +898,31 @@ func timeRollingAverage(t, c []float64, windowSec float64, maxPoints int) (outT,
 		outC = append(outC, avg[i])
 	}
 	return outT, outC
+}
+
+// trailingAverage smooths the raw samples themselves by averaging each
+// point with the win-1 readings before it (partial windows at the start
+// use however many samples are available). Unlike movingAverage's centered
+// window, the most recent point's smoothed value is the average of exactly
+// the last `win` raw readings — matching "smooth over the last N readings"
+// — and unlike the Roll Avg overlay, this replaces the plotted/stat values
+// instead of adding another line.
+func trailingAverage(c []float64, win int) []float64 {
+	n := len(c)
+	out := make([]float64, n)
+	sum := 0.0
+	for i := 0; i < n; i++ {
+		sum += c[i]
+		if i >= win {
+			sum -= c[i-win]
+		}
+		count := win
+		if i+1 < count {
+			count = i + 1
+		}
+		out[i] = sum / float64(count)
+	}
+	return out
 }
 
 // movingAverage is a centered simple moving average ("same" mode, like

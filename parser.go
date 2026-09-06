@@ -55,3 +55,19 @@ func formatCurrent(amps float64) string {
 func formatMilliamps(amps float64) string {
 	return fmt.Sprintf("%.2f", amps*1e3)
 }
+
+// formatPower renders a human-readable, auto-ranged power string, mirroring
+// formatCurrent's thresholds (nW/uW/mW/W instead of nA/uA/mA/A).
+func formatPower(watts float64) string {
+	a := math.Abs(watts)
+	switch {
+	case a >= 1.0:
+		return fmt.Sprintf("%.3f W", watts)
+	case a >= 1e-3:
+		return fmt.Sprintf("%.3f mW", watts*1e3)
+	case a >= 1e-6:
+		return fmt.Sprintf("%.3f uW", watts*1e6)
+	default:
+		return fmt.Sprintf("%.1f nW", watts*1e9)
+	}
+}

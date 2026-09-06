@@ -363,7 +363,7 @@ type chartRenderer struct {
 func (r *chartRenderer) Layout(size fyne.Size) {
 	r.raster.Resize(size)
 }
-func (r *chartRenderer) MinSize() fyne.Size            { return fyne.NewSize(400, 300) }
-func (r *chartRenderer) Refresh()                      { r.raster.Refresh() }
-func (r *chartRenderer) Objects() []fyne.CanvasObject  { return []fyne.CanvasObject{r.raster} }
-func (r *chartRenderer) Destroy()                      {}
+func (r *chartRenderer) MinSize() fyne.Size           { return fyne.NewSize(400, 300) }
+func (r *chartRenderer) Refresh()                     { r.raster.Refresh() }
+func (r *chartRenderer) Objects() []fyne.CanvasObject { return []fyne.CanvasObject{r.raster} }
+func (r *chartRenderer) Destroy()                     {}

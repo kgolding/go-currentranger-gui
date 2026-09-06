@@ -29,7 +29,7 @@ func main() {
 	a.Settings().SetTheme(darkTheme{})
 
 	w := a.NewWindow("CurrentRanger Monitor")
-	w.Resize(fyne.NewSize(1200, 800))
+	w.Resize(fyne.NewSize(1200, 850))
 
 	crApp := NewCurrentRangerApp(w, *port)
 	w.SetContent(crApp.Build())

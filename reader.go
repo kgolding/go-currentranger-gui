@@ -12,9 +12,9 @@ import (
 )
 
 const (
-	baudRate      = 230400
-	readTimeout   = 50 * time.Millisecond
-	maxPoints     = 500000 // rolling buffer (~6 min at 1300 Hz)
+	baudRate    = 230400
+	readTimeout = 50 * time.Millisecond
+	maxPoints   = 500000 // rolling buffer (~6 min at 1300 Hz)
 )
 
 // SerialReader mirrors the Python SerialReader thread: it owns the serial
