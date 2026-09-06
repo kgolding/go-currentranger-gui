@@ -1,0 +1,12 @@
+[Details]
+Icon = "icon.png"
+Name = "CurrentRanger GUI"
+ID = "uk.co.kgolding.go-currentranger-gui"
+Version = "1.0.0"
+Build = 2
+
+[LinuxAndBSD]
+GenericName = "CurrentRanger GUI"
+Categories = ["Development", "Electronics"]
+Comment = "Connect to a CurrentRanger device"
+Keywords = ["CurrentRanger", "monitor"]

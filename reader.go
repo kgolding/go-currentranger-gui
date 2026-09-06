@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -74,6 +76,18 @@ func (r *SerialReader) connect() error {
 	}
 	time.Sleep(300 * time.Millisecond)
 
+	// Discard whatever accumulated in the OS receive buffer during that
+	// settle time before checking. Since nothing ever tells the device to
+	// turn logging off on disconnect, it's always left ON from the last
+	// session — so the 'u' above just turned it OFF, but the buffer can
+	// still hold ~300ms of samples the device emitted before it actually
+	// processed the toggle. Peeking without flushing first would read one
+	// of those stale bytes and wrongly conclude logging is still on,
+	// skipping the corrective second toggle below — leaving the device
+	// silently off while the app reports a healthy connection.
+	_ = p.ResetInputBuffer()
+	time.Sleep(100 * time.Millisecond)
+
 	peek := make([]byte, 1)
 	_ = p.SetReadTimeout(10 * time.Millisecond)
 	n, _ := p.Read(peek)
@@ -83,7 +97,7 @@ func (r *SerialReader) connect() error {
 		if _, err := p.Write([]byte("u")); err != nil {
 			return closeOnErr(err)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 	_ = p.ResetInputBuffer()
 	return closeOnErr(p.SetReadTimeout(readTimeout))
@@ -157,11 +171,16 @@ func (r *SerialReader) run() {
 	}
 }
 
-// isTimeoutErr treats a zero-byte, nil-error read (the common timeout
-// behavior for go.bug.st/serial) or a bufio timeout-flavored error as
-// non-fatal so the loop keeps polling instead of tearing down the port.
+// isTimeoutErr treats read-timeout-flavored errors as non-fatal so the loop
+// keeps polling instead of tearing down an otherwise-healthy port:
+//   - "EOF": the common zero-byte, nil-error read timeout for
+//     go.bug.st/serial, once bufio turns it into an error.
+//   - io.ErrNoProgress: bufio.Reader gives up and returns this if the
+//     underlying Read() times out (0 bytes, nil error) 100 times in a row
+//     within a single ReadString call — i.e. the device has just been quiet
+//     for maxConsecutiveEmptyReads*readTimeout (~5s), not a real I/O fault.
 func isTimeoutErr(err error) bool {
-	return err != nil && err.Error() == "EOF"
+	return err != nil && (err.Error() == "EOF" || errors.Is(err, io.ErrNoProgress))
 }
 
 func (r *SerialReader) Stop() {

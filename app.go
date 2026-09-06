@@ -86,7 +86,7 @@ func NewCurrentRangerApp(win fyne.Window, initialPort string) *App {
 	a := &App{
 		win:          win,
 		chart:        NewChartWidget(),
-		timeWindow:   30,
+		timeWindow:   10,
 		rollingAvgMs: 1000,
 		stopUpdate:   make(chan struct{}),
 	}
@@ -150,7 +150,7 @@ func (a *App) buildToolbar() {
 // toolbar), LIVE STATS, and SELECTION.
 func (a *App) buildStatsPanel() fyne.CanvasObject {
 	a.windowSelect = widget.NewSelect(windowOptions, a.onWindowChange)
-	a.windowSelect.Selected = "30s"
+	a.windowSelect.Selected = "10s"
 
 	a.scaleSelect = widget.NewSelect(scaleOptions, a.onScaleChange)
 	a.scaleSelect.Selected = "Auto"
@@ -302,12 +302,12 @@ func (a *App) onWindowChange(val string) {
 
 func (a *App) onScaleChange(val string) {
 	a.yScale = scaleAmps[val]
-	a.tick()
+	fyne.Do(a.tick)
 }
 
 func (a *App) onRollAvgChange(val string) {
 	a.rollingAvgMs = rollAvgMillis[val]
-	a.tick()
+	fyne.Do(a.tick)
 }
 
 func (a *App) togglePause() {
