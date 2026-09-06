@@ -4,7 +4,7 @@ Real-time current monitoring GUI for the [LowPowerLab CurrentRanger](https://low
 
 Connects over USB serial, parses the CurrentRanger's scientific-notation output, and plots current draw in real time in a dark-themed desktop window.
 
-![CurrentRanger GUI](img/Screenshot_20260906_142902.png)
+![CurrentRanger GUI](img/CurrentRangerScreenShot-Linux.png)
 
 ## About this port
 
